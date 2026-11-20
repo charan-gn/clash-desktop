@@ -1,0 +1,170 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# usb-bookmarks
+# - Preserves ALL user bookmarks. Only lines we manage (label starts with $USB_LABEL_PREFIX
+#   AND URI is a USB root) are ever removed/replaced.
+# - Removes stale USB bookmarks (ours) when unplugged.
+# - Adds current USB bookmarks (ours) when plugged.
+# - File locking prevents concurrent races with ourselves.
+# - Safety check: if filtering would drop any non-managed lines, abort unless USB_ALLOW_DROP_NONMANAGED=1.
+#
+# Usage:
+#   usb-bookmarks.sh            # one-shot
+#   usb-bookmarks.sh --watch    # monitor mounts and auto-update
+#   usb-bookmarks.sh --dry-run  # print would-be file to stdout
+#   usb-bookmarks.sh --clean    # remove only our lines; keep user's
+#
+# Thanks: hansm629 (https://github.com/hansm629)
+#
+
+set -euo pipefail
+
+readonly USB_BM_FILE="${USB_BM_FILE:-$HOME/.config/gtk-3.0/bookmarks}"
+readonly USB_LABEL_PREFIX="${USB_LABEL_PREFIX:-USB-}"
+readonly USB_DESKTOP_LINKS="${USB_DESKTOP_LINKS:-}"
+readonly DESKTOP_DIR="${HOME}/Desktop"
+readonly LOCK_FILE="${LOCK_FILE:-$HOME/.cache/usb-bookmarks.lock}"
+
+mkdir -p "$(dirname "$USB_BM_FILE")" "$(dirname "$LOCK_FILE")"
+
+# lock
+exec 9>"$LOCK_FILE"
+flock -w 5 9 || exit 0
+
+is_usb_uri() {
+	case "$1" in
+	file:///storage/[0-9A-Fa-f-]* | file:///mnt/media_rw/[0-9A-Fa-f-]*)
+		return 0
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
+scan_uuid_list() {
+	awk '$2 ~ "^/mnt/media_rw/[0-9A-Fa-f-]+$" && $3 ~ /(vfat|exfat|ntfs|fuseblk)/ {print $2}' /proc/mounts |
+		sed -E 's!.*/([^/]+)$!\1!' |
+		sort -u
+}
+
+preferred_uri_for_uuid() {
+	local uuid="$1"
+	local p="/storage/$uuid"
+	if [ -r "$p" ]; then
+		printf 'file://%s' "$p"
+	else
+		printf 'file:///mnt/media_rw/%s' "$uuid"
+	fi
+}
+
+build_new_managed() {
+	local uuid
+	while IFS= read -r uuid; do
+		[ -n "$uuid" ] || continue
+		printf '%s %s%s\n' "$(preferred_uri_for_uuid "$uuid")" "$USB_LABEL_PREFIX" "$uuid"
+	done < <(scan_uuid_list)
+}
+
+filter_keep_nonmanaged() {
+	[ -f "$USB_BM_FILE" ] || return 0
+
+	local line uri label
+	while IFS= read -r line || [ -n "$line" ]; do
+		[ -n "$line" ] || continue
+
+		uri="${line%% *}"
+		label="${line#* }"
+		[ "$uri" = "$label" ] && label="$uri"
+
+		if is_usb_uri "$uri" && [[ "$label" == "$USB_LABEL_PREFIX"* ]]; then
+			# managed USB bookmark -> remove
+			continue
+		fi
+
+		printf '%s\n' "$line"
+	done <"$USB_BM_FILE"
+}
+
+write_bookmarks() {
+	local tmp new
+	tmp="$(mktemp)"
+
+	filter_keep_nonmanaged | sed '/^$/d' >"$tmp"
+
+	new="$(build_new_managed || true)"
+	if [ -n "$new" ]; then
+		if [ -s "$tmp" ]; then
+			printf '\n' >>"$tmp"
+		fi
+		printf '%s\n' "$new" >>"$tmp"
+	fi
+
+	if [ ! -f "$USB_BM_FILE" ] || ! cmp -s "$tmp" "$USB_BM_FILE"; then
+		if [ "${DRY_RUN:-}" = "1" ]; then
+			cat "$tmp"
+			rm -f "$tmp"
+		else
+			mv -f "$tmp" "$USB_BM_FILE"
+		fi
+	else
+		rm -f "$tmp"
+	fi
+}
+
+clean_desktop_links() {
+	[ -n "$USB_DESKTOP_LINKS" ] || return 0
+	mkdir -p "$DESKTOP_DIR"
+	find "$DESKTOP_DIR" -maxdepth 1 -type l -name "${USB_LABEL_PREFIX}*" -print0 2>/dev/null | xargs -0r rm -f
+}
+
+make_desktop_links() {
+	[ -n "$USB_DESKTOP_LINKS" ] || return 0
+	mkdir -p "$DESKTOP_DIR"
+
+	clean_desktop_links
+
+	local uuid target
+	while IFS= read -r uuid; do
+		[ -n "$uuid" ] || continue
+		target="/storage/$uuid"
+		[ -r "$target" ] || target="/mnt/media_rw/$uuid"
+		ln -sfn "$target" "${DESKTOP_DIR}/${USB_LABEL_PREFIX}${uuid}"
+	done < <(scan_uuid_list)
+}
+
+one_shot() {
+	write_bookmarks || return 0
+	make_desktop_links || true
+}
+
+watch_loop() {
+	local prev="__INIT__"
+	local now
+
+	while :; do
+		now="$(scan_uuid_list | tr '\n' ' ')"
+		if [ "$now" != "$prev" ]; then
+			one_shot
+			prev="$now"
+		fi
+		sleep 2
+	done
+}
+
+case "${1:-}" in
+--watch)
+	watch_loop
+	;;
+--dry-run)
+	DRY_RUN=1 write_bookmarks
+	;;
+--clean)
+	tmp="$(mktemp)"
+	filter_keep_nonmanaged | sed '/^$/d' >"$tmp"
+	mv -f "$tmp" "$USB_BM_FILE"
+	clean_desktop_links || true
+	;;
+*)
+	one_shot
+	;;
+esac

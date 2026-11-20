@@ -1,0 +1,139 @@
+name: Check for mesa freedreno update
+on:
+    schedule:
+        - cron: "0 0 * * 0" # runs weekly on Sunday at midnight UTC
+    workflow_dispatch:
+jobs:
+    check_for_update:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+            actions: write
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v7
+
+            - name: Get old version
+              id: get_old_version
+              run: |
+                  old_version=""
+
+                  # Method 1: read the pin from enable-hw-acceleration
+                  if [ -f "enable-hw-acceleration" ]; then
+                    echo "Found enable-hw-acceleration file, attempting to read MESA_FREEDRENO_VERSION..."
+                    old_version=$(grep -oP 'MESA_FREEDRENO_VERSION="\K[^"]+' enable-hw-acceleration | head -1)
+                    if [ -n "$old_version" ]; then
+                      echo "Successfully read version from file: $old_version"
+                    else
+                      echo "Failed to extract MESA_FREEDRENO_VERSION from enable-hw-acceleration"
+                      grep -n "MESA_FREEDRENO_VERSION" enable-hw-acceleration || echo "No MESA_FREEDRENO_VERSION found in file"
+                    fi
+                  else
+                    echo "enable-hw-acceleration file not found"
+                  fi
+
+                  # Method 2: fall back to our own releases
+                  if [ -z "$old_version" ]; then
+                    echo "Falling back to GitHub releases method..."
+                    old_version=$(gh api repos/${{ github.repository }}/releases --paginate \
+                      --jq '.[] | select(.tag_name | startswith("mesa-freedreno-")) | .tag_name' | \
+                      sed 's/mesa-freedreno-//' | \
+                      sort -Vr | \
+                      head -1)
+                    if [ -n "$old_version" ]; then
+                      echo "Successfully read version from GitHub releases: $old_version"
+                    fi
+                  fi
+
+                  if [ -z "$old_version" ]; then
+                    echo "ERROR: Unable to determine the current mesa freedreno version using any method"
+                    echo "- enable-hw-acceleration file not found or doesn't contain MESA_FREEDRENO_VERSION"
+                    echo "- No mesa-freedreno-* releases found in GitHub repository"
+                    exit 1
+                  fi
+
+                  echo "old_version=$old_version" >> $GITHUB_OUTPUT
+                  echo "Current mesa freedreno version: $old_version"
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Get new version
+              id: get_new_version
+              run: |
+                  # Only the mesa-* tags carry the KGSL gallium driver, the turnip-*
+                  # ones are Turnip only. Distro specific tags (fc43 and so on) are
+                  # filtered out too, we build the generic one ourself.
+                  latest_tag=$(gh api repos/lfdevs/mesa-for-android-container/tags --paginate \
+                    --jq '.[].name' | \
+                    grep -E '^mesa-[0-9]+\.[0-9]+\.[0-9]+-devel-[0-9]{8}$' | \
+                    sort -Vr | \
+                    head -1)
+
+                  if [ -z "$latest_tag" ]; then
+                    echo "ERROR: Could not find any mesa-*-devel-* tag upstream"
+                    exit 1
+                  fi
+
+                  echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
+                  echo "latest_version=${latest_tag#mesa-}" >> $GITHUB_OUTPUT
+                  echo "Latest upstream tag: $latest_tag"
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Compare versions
+              id: compare_versions
+              run: |
+                  old_version="${{ steps.get_old_version.outputs.old_version }}"
+                  latest_version="${{ steps.get_new_version.outputs.latest_version }}"
+
+                  echo "Comparing versions: $old_version vs $latest_version"
+
+                  if [ "$old_version" = "$latest_version" ]; then
+                    echo "need_update=false" >> $GITHUB_OUTPUT
+                    echo "Versions are the same, no update needed"
+                  elif printf '%s\n%s\n' "$old_version" "$latest_version" | sort -V -C; then
+                    # sort -V -C succeeds when the input is already ascending, and
+                    # equality was handled above, so old_version < latest_version
+                    echo "need_update=true" >> $GITHUB_OUTPUT
+                    echo "Update needed: $old_version -> $latest_version"
+                  else
+                    echo "need_update=false" >> $GITHUB_OUTPUT
+                    echo "Current version ($old_version) is newer than latest ($latest_version), no update needed"
+                  fi
+
+            - name: Trigger mesa freedreno build
+              if: steps.compare_versions.outputs.need_update == 'true'
+              run: |
+                  echo "Triggering the build workflow with tag: ${{ steps.get_new_version.outputs.latest_tag }}"
+
+                  # Retry loop logic
+                  max_retries=3
+                  count=0
+                  success=false
+
+                  while [ $count -lt $max_retries ]; do
+                    if gh workflow run mesa-freedreno-builder.yml --ref main --field mesa_freedreno_tag="${{ steps.get_new_version.outputs.latest_tag }}"; then
+                      echo "✅ Workflow triggered successfully"
+                      success=true
+                      break
+                    else
+                      count=$((count + 1))
+                      echo "⚠️ Failed to trigger workflow (Attempt $count/$max_retries)"
+                      if [ $count -lt $max_retries ]; then
+                        echo "Retrying in 10 seconds..."
+                        sleep 10
+                      fi
+                    fi
+                  done
+
+                  if [ "$success" = false ]; then
+                    echo "❌ Failed to trigger workflow after $max_retries attempts"
+                    exit 1
+                  fi
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: No update needed
+              if: steps.compare_versions.outputs.need_update == 'false'
+              run: |
+                  echo "No update needed. Current version ${{ steps.get_old_version.outputs.old_version }} is up to date with the latest upstream tag ${{ steps.get_new_version.outputs.latest_tag }}"

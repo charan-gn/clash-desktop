@@ -1,0 +1,173 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+function setup_td_zsh_theme() {
+	check_and_create_directory "$TERMUX_HOME/.zsh-themes"
+	cat <<-EOF >"$TERMUX_HOME/.zsh-themes/td.zsh-theme"
+		# td.zsh-theme - A clean and functional ZSH theme with distro detection
+		# Created for Termux and proot-distro environments
+
+		autoload -Uz colors && colors
+		autoload -Uz vcs_info
+		setopt complete_aliases
+
+		# Enable Git branch display
+		zstyle ':vcs_info:git:*' formats ' %F{magenta} %b%f'
+		precmd() { vcs_info }
+		setopt PROMPT_SUBST
+
+		# Exit status indicator
+		exit_status="%(?..%F{red}✘ %?%f)"
+
+		# Detect distro and set the correct icons
+		if command -v grep &> /dev/null && [ -f /etc/os-release ]; then
+		    distro_id=\$(grep '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"') 2>/dev/null
+		else
+		    distro_id="unknown"
+		fi
+
+		case "\$distro_id" in
+		  kali) DISTRO_ICON="" ;;   # Kali Linux
+		  arch*) DISTRO_ICON="" ;;   # Arch Linux
+		  ubuntu) DISTRO_ICON="" ;; # Ubuntu
+		  debian) DISTRO_ICON="" ;; # Debian
+		  fedora) DISTRO_ICON="" ;; # Fedora
+		  alpine) DISTRO_ICON="" ;; # Alpine
+		  void) DISTRO_ICON="" ;;   # Void Linux
+		  opensuse*|sles) DISTRO_ICON="" ;; # openSUSE
+		  gentoo) DISTRO_ICON="" ;; # Gentoo
+		  nixos) DISTRO_ICON="" ;; # NixOS
+		  *) DISTRO_ICON="󰀲" ;;      # Default Linux Icon
+		esac
+
+		# Symbols
+		PROMPT_SYMBOL="%F{green}❯%F{reset}"
+
+		# Check if running in Termux and set username accordingly
+		if [[ -n "\$PREFIX" && "\$PREFIX" == */com.termux/* ]]; then
+		    user_name="${final_user_name}"
+		else
+		    user_name="\$(whoami)"
+		fi
+
+		# User and host info inside a box with DISTRO_ICON in the middle
+		user_host="%F{blue}[%F{cyan}\$user_name%F{yellow} \$DISTRO_ICON %F{cyan}%m%F{blue}]%f"
+
+		# Current directory inside the same box
+		dir_display="%F{blue}[%F{yellow}%~%F{blue}]%f"
+
+		# Prompt layout (P10K-like)
+		PROMPT='
+		%B%F{green}╭─ \$user_host \$dir_display\${vcs_info_msg_0_}
+		%B%F{green}╰─\${PROMPT_SYMBOL} %F{reset}'
+
+		# Right prompt shows exit status of previous command
+		RPROMPT="\$exit_status"
+	EOF
+}
+
+function check_parameter() {
+	if [[ -n "$PREFIX" && "$PREFIX" == *"/com.termux/"* && -z "$user_name" ]]; then
+		while true; do
+			echo " "
+			while true; do
+				read -r -p "${R}[${C}-${R}]${G} Input username [Lowercase]: ${NC}" user_name
+				if [[ -n "$user_name" ]]; then
+					break
+				else
+					print_warn "You can't leave the username empty. Please enter a valid username."
+				fi
+			done
+			echo
+			local choice
+			read -r -p "${R}[${C}-${R}]${Y} Do you want to continue with username ${C}$user_name ${Y}? (y/n) : ${NC}" choice
+			echo
+			choice="${choice:-y}"
+			echo
+			print_success "Continuing with answer: $choice"
+			sleep 0.2
+			case $choice in
+			[yY]*)
+				print_success "Continuing with username ${C}$user_name"
+				break
+				;;
+			[nN]*)
+				print_msg "Please provide username again."
+				echo
+				;;
+			*)
+				print_failed "Invalid input, Please enter y or n"
+				;;
+			esac
+		done
+	fi
+	final_user_name="${user_name}"
+}
+
+function clone_zinit() {
+	print_msg "Installing zinit..."
+	if ! git clone https://github.com/zdharma-continuum/zinit "$TERMUX_HOME/.local/share/zinit/zinit.git" 2>/dev/null; then
+		print_failed "Failed to clone zinit repository"
+		print_warn "Please check your internet connection and try again"
+		return 1
+	fi
+	print_success "Zinit installed successfully"
+	return 0
+}
+
+function set_theme() {
+	print_msg "Installing zsh theme..."
+	# shellcheck disable=SC2154
+	if [[ "$selected_zsh_theme_name" == "td_zsh" ]]; then
+		check_parameter
+		setup_td_zsh_theme
+		cat <<EOF >>"$TERMUX_HOME/.zshrc"
+# Load theme
+source "$TERMUX_HOME/.zsh-themes/td.zsh-theme"
+EOF
+	elif [[ "$selected_zsh_theme_name" == "p10k_zsh" ]]; then
+		cat <<'EOF' >>"$TERMUX_HOME/.zshrc"
+# Powerlevel10k Theme.
+zinit ice depth=1; zinit light romkatv/powerlevel10k
+EOF
+	elif [[ "$selected_zsh_theme_name" == "pure_zsh" ]]; then
+		cat <<'EOF' >>"$TERMUX_HOME/.zshrc"
+# Load pure theme
+zinit ice pick"async.zsh" src"pure.zsh" # with zsh-async library that's bundled with it.
+zinit light sindresorhus/pure
+EOF
+	else
+		check_parameter
+		setup_td_zsh_theme
+		cat <<EOF >>"$TERMUX_HOME/.zshrc"
+# Load theme
+source "$TERMUX_HOME/.zsh-themes/td.zsh-theme"
+EOF
+	fi
+}
+
+write_zsh_config() {
+	download_file "$TERMUX_HOME/.zshenv2" "https://raw.githubusercontent.com/sabamdarif/termux-desktop/refs/heads/main/other/.zshenv" || {
+		print_failed "Failed to download .zshenv configuration"
+		return 1
+	}
+	cat "$TERMUX_HOME/.zshenv2" >>"$TERMUX_HOME/.zshenv"
+	check_and_delete "$TERMUX_HOME/.zshenv2"
+
+	download_file "$TERMUX_HOME/.zshrc2" "https://raw.githubusercontent.com/sabamdarif/termux-desktop/refs/heads/main/other/.zshrc" || {
+		print_failed "Failed to download .zshrc configuration"
+		return 1
+	}
+	cat "$TERMUX_HOME/.zshrc2" >>"$TERMUX_HOME/.zshrc"
+	check_and_delete "$TERMUX_HOME/.zshrc2"
+
+	zsh -i -c "source $TERMUX_HOME/.zshrc; exit" 2>/dev/null || {
+		print_warn "Failed to source .zshrc, but configuration files were written"
+	}
+}
+
+check_and_backup "$TERMUX_HOME/.zshrc"
+check_and_delete "$TERMUX_HOME/.zshrc"
+clone_zinit
+write_zsh_config
+set_theme
+chsh -s zsh
